@@ -54,6 +54,7 @@ CONFIG = {}
 LAST_DAILY_REPORT = None
 LAST_ERROR_EMAIL = {}  # 记录最近发送的错误邮件，防止重复发送
 LAST_CRASH_EMAIL = {}  # 记录最近发送的暴跌邮件，防止重复发送
+LAST_PRICE_ALERT = {}  # 记录价格阈值提醒的发送时间，结构: {metal_type: {threshold: datetime}}
 IS_FIRST_RUN = True  # 标记是否是首次运行
 
 # 金属类型配置
@@ -99,11 +100,34 @@ def load_config():
         },
         'monitor': {
             'check_interval': config.getint('Monitor', 'check_interval'),
-            'crash_threshold': config.getfloat('Monitor', 'crash_threshold'),
+            'gold_crash_threshold': config.getfloat('Monitor', 'gold_crash_threshold', fallback=-2.0),
+            'silver_crash_threshold': config.getfloat('Monitor', 'silver_crash_threshold', fallback=-3.0),
+            'platinum_crash_threshold': config.getfloat('Monitor', 'platinum_crash_threshold', fallback=-2.5),
+            'palladium_crash_threshold': config.getfloat('Monitor', 'palladium_crash_threshold', fallback=-3.5),
+            'price_alert_interval': config.getint('Monitor', 'price_alert_interval', fallback=3600),
             'daily_report_times': [t.strip() for t in config.get('Monitor', 'daily_report_times').split(',')],
             'max_retries': config.getint('Monitor', 'max_retries', fallback=3),
             'retry_delay': config.getint('Monitor', 'retry_delay', fallback=5),
         },
+        'price_thresholds': {}
+    }
+
+    # 加载价格阈值配置
+    for metal_type in METAL_TYPES.keys():
+        threshold_key = f'{metal_type}_price_thresholds'
+        threshold_str = config.get('Monitor', threshold_key, fallback='').strip()
+        if threshold_str:
+            try:
+                thresholds = [float(t.strip()) for t in threshold_str.split(',') if t.strip()]
+                CONFIG['price_thresholds'][metal_type] = sorted(thresholds)  # 排序便于处理
+            except ValueError as e:
+                print(f"警告: {threshold_key} 配置格式错误: {e}")
+                CONFIG['price_thresholds'][metal_type] = []
+        else:
+            CONFIG['price_thresholds'][metal_type] = []
+
+    # 配置结构继续
+    CONFIG.update({
         'api': {
             'gold_api_url': config.get('API', 'gold_api_url'),
             'silver_api_url': config.get('API', 'silver_api_url'),
@@ -122,7 +146,7 @@ def load_config():
             'history_days': config.getint('Storage', 'history_days'),
             'save_ai_analysis': config.getboolean('Storage', 'save_ai_analysis', fallback=True),
         }
-    }
+    })
 
     # 创建图表目录
     charts_dir = Path(__file__).parent / CONFIG['storage']['charts_dir']
@@ -545,9 +569,14 @@ def detect_crash(all_metals_data):
             continue
 
         parsed_data = metal_data['parsed_data']
+        # 获取该金属特定的暴跌阈值
+        threshold_key = f'{metal_type}_crash_threshold'
+        crash_threshold = CONFIG['monitor'].get(threshold_key, -2.0)
+
         crash_info = {
             'metal_type': metal_type,
             'metal_name': METAL_TYPES[metal_type]['name'],
+            'threshold': crash_threshold,
             'is_crash': False,
             'rate': 0,
             'current_price': 0,
@@ -560,7 +589,7 @@ def detect_crash(all_metals_data):
             crash_info['rate'] = latest['rate']
             crash_info['current_price'] = latest['price']
 
-            if latest['rate'] <= CONFIG['monitor']['crash_threshold']:
+            if latest['rate'] <= crash_threshold:
                 crash_info['is_crash'] = True
 
         # 从日数据检测（作为补充）
@@ -570,7 +599,7 @@ def detect_crash(all_metals_data):
 
             if yesterday['close'] > 0:
                 rate = ((today['close'] - yesterday['close']) / yesterday['close']) * 100
-                if rate <= CONFIG['monitor']['crash_threshold']:
+                if rate <= crash_threshold:
                     crash_info['is_crash'] = True
                     crash_info['rate'] = rate
                     crash_info['current_price'] = today['close']
@@ -580,6 +609,131 @@ def detect_crash(all_metals_data):
             crash_list.append(crash_info)
 
     return crash_list
+
+
+def check_price_thresholds(all_metals_data):
+    """检测价格阈值触发"""
+    alert_list = []
+
+    for metal_type, metal_data in all_metals_data.items():
+        if not metal_data or not metal_data.get('parsed_data'):
+            continue
+
+        # 获取该金属的价格阈值列表
+        thresholds = CONFIG['price_thresholds'].get(metal_type, [])
+        if not thresholds:
+            continue
+
+        parsed_data = metal_data['parsed_data']
+        if not parsed_data['realtime'] or len(parsed_data['realtime']) == 0:
+            continue
+
+        latest = parsed_data['realtime'][-1]
+        current_price = latest['price']
+
+        # 检查每个阈值
+        for threshold in thresholds:
+            # 判断是否触发阈值（当前价格接近阈值）
+            # 使用0.5%的误差范围来判断是否到达阈值
+            price_diff_percent = abs(current_price - threshold) / threshold * 100
+            if price_diff_percent <= 0.5:  # 在阈值附近0.5%范围内
+                alert_info = {
+                    'metal_type': metal_type,
+                    'metal_name': METAL_TYPES[metal_type]['name'],
+                    'threshold': threshold,
+                    'current_price': current_price,
+                    'direction': '突破' if current_price >= threshold else '接近'
+                }
+                alert_list.append(alert_info)
+
+    return alert_list
+
+
+def should_send_price_alert(alert_list):
+    """检查是否应该发送价格阈值提醒（每个阈值在配置的时间间隔内只发送一次）"""
+    global LAST_PRICE_ALERT
+
+    if not alert_list:
+        return []
+
+    current_time = datetime.now()
+    alert_interval = CONFIG['monitor']['price_alert_interval']
+    alerts_to_send = []
+
+    for alert in alert_list:
+        metal_type = alert['metal_type']
+        threshold = str(alert['threshold'])  # 转换为字符串作为key
+
+        # 初始化该金属的记录字典
+        if metal_type not in LAST_PRICE_ALERT:
+            LAST_PRICE_ALERT[metal_type] = {}
+
+        # 检查该阈值是否在配置的时间间隔内已发送
+        if threshold in LAST_PRICE_ALERT[metal_type]:
+            last_time = LAST_PRICE_ALERT[metal_type][threshold]
+            time_diff = (current_time - last_time).total_seconds()
+            if time_diff < alert_interval:
+                time_diff_minutes = time_diff / 60
+                interval_minutes = alert_interval / 60
+                print(f"  ℹ️  {alert['metal_name']}价格阈值¥{threshold}/克在{time_diff_minutes:.1f}分钟前已发送提醒（间隔{interval_minutes:.0f}分钟），跳过本次发送")
+                continue
+
+        # 可以发送，记录时间
+        LAST_PRICE_ALERT[metal_type][threshold] = current_time
+        alerts_to_send.append(alert)
+
+    return alerts_to_send
+
+
+def format_price_alert_email(alert_list, all_metals_data, chart_files, ai_analysis):
+    """格式化价格阈值提醒邮件"""
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 标题包含所有触发的阈值
+    alert_names = [f"{alert['metal_name']}¥{alert['threshold']}" for alert in alert_list]
+    subject = f"💰 贵金属价格阈值提醒 - {'/'.join(alert_names)} - {current_time}"
+
+    body = f"""贵金属价格阈值提醒！
+
+检测时间: {current_time}
+提醒原因: 以下金属价格达到设定的阈值
+
+"""
+
+    # 列出所有触发的阈值详情
+    body += "=== 阈值触发详情 ===\n\n"
+    for alert in alert_list:
+        body += f"""【{alert['metal_name']}】
+  目标阈值: ¥{alert['threshold']:.2f} 元/克
+  当前价格: ¥{alert['current_price']:.2f} 元/克
+  状态: {alert['direction']}
+
+"""
+
+    # 添加所有金属的当前状态
+    body += "=== 所有金属当前状态 ===\n\n"
+    for metal_type, metal_data in all_metals_data.items():
+        if metal_data and metal_data.get('parsed_data') and metal_data['parsed_data']['realtime']:
+            latest = metal_data['parsed_data']['realtime'][-1]
+            metal_name = METAL_TYPES[metal_type]['name']
+            body += f"【{metal_name}】¥{latest['price']:.2f} 元/克 ({latest['rate']:+.2f}%)\n"
+
+    if ai_analysis:
+        body += f"""
+
+=== AI 智能分析 ===
+
+{ai_analysis}
+"""
+
+    body += f"""
+
+---
+贵金属价格监控系统
+{current_time}
+"""
+
+    return subject, body
 
 
 def send_email(subject, body, image_paths=None, is_html=False):
@@ -638,7 +792,7 @@ def format_crash_email(crash_list, all_metals_data, chart_files, ai_analysis):
     body = f"""贵金属价格暴跌警告！
 
 检测时间: {current_time}
-警告原因: 以下金属价格跌幅超过设定阈值 {CONFIG['monitor']['crash_threshold']}%
+警告原因: 以下金属价格跌幅超过各自设定的阈值
 
 """
 
@@ -648,6 +802,7 @@ def format_crash_email(crash_list, all_metals_data, chart_files, ai_analysis):
         body += f"""【{crash['metal_name']}】
   当前价格: ¥{crash['current_price']:.2f} 元/克
   跌幅: {crash['rate']:.2f}%
+  触发阈值: {crash['threshold']:.1f}%
 
 """
 
@@ -697,7 +852,11 @@ def format_startup_email(all_metals_data, chart_files, ai_analysis):
 
 监控金属: {', '.join([METAL_TYPES[t]['name'] for t in METAL_TYPES.keys()])}
 监控间隔: {CONFIG['monitor']['check_interval']}秒 ({CONFIG['monitor']['check_interval']//60}分钟)
-暴跌阈值: {CONFIG['monitor']['crash_threshold']}%
+暴跌阈值:
+  · 黄金: {CONFIG['monitor']['gold_crash_threshold']:.1f}%
+  · 白银: {CONFIG['monitor']['silver_crash_threshold']:.1f}%
+  · 铂金: {CONFIG['monitor']['platinum_crash_threshold']:.1f}%
+  · 钯金: {CONFIG['monitor']['palladium_crash_threshold']:.1f}%
 定时报告: {', '.join(CONFIG['monitor']['daily_report_times'])}
 AI分析: {'已启用（结合最近新闻）' if CONFIG['ai']['enable'] else '未启用'}
 
@@ -1051,6 +1210,23 @@ def monitor_once():
         else:
             print(f"✓ 所有金属价格正常")
 
+        # 检测价格阈值
+        print("\n正在检测价格阈值...")
+        price_alert_list = check_price_thresholds(all_metals_data)
+
+        # 检查是否需要发送价格阈值提醒
+        alerts_to_send = []
+        if price_alert_list:
+            alert_details = [f"{alert['metal_name']}¥{alert['threshold']}" for alert in price_alert_list]
+            print(f"💰 检测到价格阈值触发! 涉及: {', '.join(alert_details)}")
+
+            # 检查是否应该发送（每个阈值1小时去重）
+            alerts_to_send = should_send_price_alert(price_alert_list)
+            if not alerts_to_send:
+                print("  （所有阈值提醒均已在1小时内发送过，跳过本次发送）")
+        else:
+            print(f"✓ 未触发价格阈值")
+
         # 检查是否需要发送每日报告
         need_daily_report = should_send_daily_report()
 
@@ -1060,7 +1236,7 @@ def monitor_once():
 
         # 只有在需要发送邮件时才进行AI分析（节省API调用）
         ai_analysis = None
-        if need_crash_email or need_daily_report or need_startup_email:
+        if need_crash_email or need_daily_report or need_startup_email or alerts_to_send:
             if CONFIG['ai']['enable']:
                 print("\n正在进行AI分析（结合最近新闻）...")
                 ai_analysis = get_ai_analysis(all_metals_data, chart_files)
@@ -1090,6 +1266,12 @@ def monitor_once():
         if need_daily_report:
             print("\n📧 发送每日报告...")
             subject, body = format_daily_email(all_metals_data, chart_files, ai_analysis)
+            send_email(subject, body, chart_files)
+
+        # 发送价格阈值提醒
+        if alerts_to_send:
+            print(f"\n📧 发送价格阈值提醒（{len(alerts_to_send)}个阈值）...")
+            subject, body = format_price_alert_email(alerts_to_send, all_metals_data, chart_files, ai_analysis)
             send_email(subject, body, chart_files)
 
         # 显示当前价格信息
@@ -1127,7 +1309,30 @@ def main():
     print("="*70)
     print(f"监控金属: {', '.join([METAL_TYPES[t]['name'] for t in METAL_TYPES.keys()])}")
     print(f"监控间隔: {CONFIG['monitor']['check_interval']}秒 ({CONFIG['monitor']['check_interval']//60}分钟)")
-    print(f"暴跌阈值: {CONFIG['monitor']['crash_threshold']}%")
+    print("暴跌阈值:")
+    print(f"  · 黄金: {CONFIG['monitor']['gold_crash_threshold']:.1f}%")
+    print(f"  · 白银: {CONFIG['monitor']['silver_crash_threshold']:.1f}%")
+    print(f"  · 铂金: {CONFIG['monitor']['platinum_crash_threshold']:.1f}%")
+    print(f"  · 钯金: {CONFIG['monitor']['palladium_crash_threshold']:.1f}%")
+
+    # 显示价格阈值配置
+    print("价格阈值:")
+    has_thresholds = False
+    for metal_type in METAL_TYPES.keys():
+        metal_name = METAL_TYPES[metal_type]['name']
+        thresholds = CONFIG['price_thresholds'].get(metal_type, [])
+        if thresholds:
+            has_thresholds = True
+            threshold_count = len(thresholds)
+            threshold_range = f"¥{min(thresholds):.0f}-{max(thresholds):.0f}"
+            print(f"  · {metal_name}: {threshold_count}个阈值 ({threshold_range})")
+        else:
+            print(f"  · {metal_name}: 未设置")
+
+    if has_thresholds:
+        interval_minutes = CONFIG['monitor']['price_alert_interval'] / 60
+        print(f"  提醒间隔: {interval_minutes:.0f}分钟")
+
     print(f"重试次数: {CONFIG['monitor']['max_retries']}次")
     print(f"重试延迟: {CONFIG['monitor']['retry_delay']}秒")
     print(f"通知邮箱: {CONFIG['email']['receiver_email']}")
