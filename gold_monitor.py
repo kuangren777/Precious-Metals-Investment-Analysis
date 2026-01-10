@@ -400,9 +400,11 @@ def get_ai_analysis(all_metals_data, chart_files):
                 summary['current_price'] = latest['price']
                 summary['current_rate'] = latest['rate']
 
-            if parsed_data['day']:
-                summary['day_high'] = max([d['high'] for d in parsed_data['day']])
-                summary['day_low'] = min([d['low'] for d in parsed_data['day']])
+            if parsed_data['day'] and len(parsed_data['day']) > 0:
+                # 取最后一条数据（今天）的最高和最低价格
+                today = parsed_data['day'][-1]
+                summary['day_high'] = today['high']
+                summary['day_low'] = today['low']
 
             if parsed_data['week']:
                 summary['week_trend'] = [{'date': w['time'][:10], 'close': w['close']} for w in parsed_data['week'][-4:]]
@@ -907,9 +909,11 @@ AI分析: {'已启用（结合最近新闻）' if CONFIG['ai']['enable'] else '�
             current_price = latest['price']
             current_rate = latest['rate']
 
-        if parsed_data['day']:
-            day_high = max([d['high'] for d in parsed_data['day']])
-            day_low = min([d['low'] for d in parsed_data['day']])
+        if parsed_data['day'] and len(parsed_data['day']) > 0:
+            # 取最后一条数据（今天）的最高和最低价格
+            today = parsed_data['day'][-1]
+            day_high = today['high']
+            day_low = today['low']
 
         body += f"""【{metal_name}】
   当前价格: ¥{current_price:.2f} 元/克
@@ -978,9 +982,11 @@ def format_daily_email(all_metals_data, chart_files, ai_analysis):
             current_price = latest['price']
             current_rate = latest['rate']
 
-        if parsed_data['day']:
-            day_high = max([d['high'] for d in parsed_data['day']])
-            day_low = min([d['low'] for d in parsed_data['day']])
+        if parsed_data['day'] and len(parsed_data['day']) > 0:
+            # 取最后一条数据（今天）的最高和最低价格
+            today = parsed_data['day'][-1]
+            day_high = today['high']
+            day_low = today['low']
 
         body += f"""【{metal_name}】
   当前价格: ¥{current_price:.2f} 元/克
