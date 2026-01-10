@@ -55,6 +55,7 @@ LAST_DAILY_REPORT = None
 LAST_ERROR_EMAIL = {}  # 记录最近发送的错误邮件，防止重复发送
 LAST_CRASH_EMAIL = {}  # 记录最近发送的暴跌邮件，防止重复发送
 LAST_PRICE_ALERT = {}  # 记录价格阈值提醒的发送时间，结构: {metal_type: {threshold: datetime}}
+LAST_PRICES = {}  # 记录上次检查时的价格，用于检测阈值穿越，结构: {metal_type: price}
 IS_FIRST_RUN = True  # 标记是否是首次运行
 
 # 金属类型配置
@@ -612,7 +613,8 @@ def detect_crash(all_metals_data):
 
 
 def check_price_thresholds(all_metals_data):
-    """检测价格阈值触发"""
+    """检测价格阈值触发（只在价格穿越阈值时触发）"""
+    global LAST_PRICES
     alert_list = []
 
     for metal_type, metal_data in all_metals_data.items():
@@ -631,20 +633,42 @@ def check_price_thresholds(all_metals_data):
         latest = parsed_data['realtime'][-1]
         current_price = latest['price']
 
-        # 检查每个阈值
+        # 获取上次价格
+        last_price = LAST_PRICES.get(metal_type)
+
+        # 如果没有上次价格（首次运行），保存当前价格并跳过检测
+        if last_price is None:
+            LAST_PRICES[metal_type] = current_price
+            continue
+
+        # 检查每个阈值是否被穿越
         for threshold in thresholds:
-            # 判断是否触发阈值（当前价格接近阈值）
-            # 使用0.5%的误差范围来判断是否到达阈值
-            price_diff_percent = abs(current_price - threshold) / threshold * 100
-            if price_diff_percent <= 0.5:  # 在阈值附近0.5%范围内
+            crossed = False
+            direction = None
+
+            # 向上穿越：上次价格 < 阈值，当前价格 >= 阈值
+            if last_price < threshold <= current_price:
+                crossed = True
+                direction = '向上突破'
+
+            # 向下穿越：上次价格 > 阈值，当前价格 <= 阈值
+            elif last_price > threshold >= current_price:
+                crossed = True
+                direction = '向下突破'
+
+            if crossed:
                 alert_info = {
                     'metal_type': metal_type,
                     'metal_name': METAL_TYPES[metal_type]['name'],
                     'threshold': threshold,
                     'current_price': current_price,
-                    'direction': '突破' if current_price >= threshold else '接近'
+                    'last_price': last_price,
+                    'direction': direction
                 }
                 alert_list.append(alert_info)
+
+        # 更新当前价格为下次检查的上次价格
+        LAST_PRICES[metal_type] = current_price
 
     return alert_list
 
@@ -696,17 +720,18 @@ def format_price_alert_email(alert_list, all_metals_data, chart_files, ai_analys
     body = f"""贵金属价格阈值提醒！
 
 检测时间: {current_time}
-提醒原因: 以下金属价格达到设定的阈值
+提醒原因: 以下金属价格突破设定的阈值
 
 """
 
     # 列出所有触发的阈值详情
-    body += "=== 阈值触发详情 ===\n\n"
+    body += "=== 阈值突破详情 ===\n\n"
     for alert in alert_list:
         body += f"""【{alert['metal_name']}】
-  目标阈值: ¥{alert['threshold']:.2f} 元/克
+  阈值价格: ¥{alert['threshold']:.2f} 元/克
+  上次价格: ¥{alert['last_price']:.2f} 元/克
   当前价格: ¥{alert['current_price']:.2f} 元/克
-  状态: {alert['direction']}
+  突破方向: {alert['direction']}
 
 """
 
