@@ -91,11 +91,28 @@ def load_config():
     config.read(config_file, encoding='utf-8')
 
     global CONFIG
+
+    # 解析管理员邮箱列表
+    admin_emails_str = config.get('Email', 'admin_emails', fallback='')
+    admin_emails = [email.strip() for email in admin_emails_str.split(',') if email.strip()]
+
+    # 解析用户邮箱列表
+    user_emails_str = config.get('Email', 'user_emails', fallback='')
+    user_emails = [email.strip() for email in user_emails_str.split(',') if email.strip()]
+
+    # 如果没有配置admin_emails和user_emails，尝试使用旧的receiver_email配置（向后兼容）
+    if not admin_emails and not user_emails:
+        receiver_emails_str = config.get('Email', 'receiver_email', fallback='')
+        receiver_emails = [email.strip() for email in receiver_emails_str.split(',') if email.strip()]
+        admin_emails = receiver_emails
+        user_emails = receiver_emails
+
     CONFIG = {
         'email': {
             'sender_email': config.get('Email', 'sender_email'),
             'sender_password': config.get('Email', 'sender_password'),
-            'receiver_email': config.get('Email', 'receiver_email'),
+            'admin_emails': admin_emails,  # 管理员邮箱列表
+            'user_emails': user_emails,    # 用户邮箱列表
             'smtp_server': config.get('Email', 'smtp_server'),
             'smtp_port': config.getint('Email', 'smtp_port'),
         },
@@ -763,15 +780,36 @@ def format_price_alert_email(alert_list, all_metals_data, chart_files, ai_analys
     return subject, body
 
 
-def send_email(subject, body, image_paths=None, is_html=False):
-    """发送邮件通知（支持多个附件）"""
+def send_email(subject, body, image_paths=None, is_html=False, recipient_type='all'):
+    """发送邮件通知（支持多个附件和多个收件人）
+
+    Args:
+        subject: 邮件主题
+        body: 邮件正文
+        image_paths: 图片附件路径（单个或列表）
+        is_html: 是否HTML格式
+        recipient_type: 收件人类型 - 'admin'(仅管理员), 'user'(仅用户), 'all'(管理员+用户)
+    """
     try:
         email_config = CONFIG['email']
+
+        # 根据recipient_type确定收件人列表
+        if recipient_type == 'admin':
+            recipients = email_config['admin_emails']
+        elif recipient_type == 'user':
+            recipients = email_config['user_emails']
+        else:  # 'all' 或其他值，发送给所有人
+            recipients = list(set(email_config['admin_emails'] + email_config['user_emails']))
+
+        if not recipients:
+            print(f"⚠️ 警告: 没有配置{recipient_type}类型的收件人邮箱，跳过发送")
+            return False
 
         # 创建邮件
         msg = MIMEMultipart()
         msg['From'] = email_config['sender_email']
-        msg['To'] = email_config['receiver_email']
+        # 支持多个收件人，用逗号分隔
+        msg['To'] = ', '.join(recipients)
         msg['Subject'] = subject
 
         # 添加正文
@@ -801,7 +839,12 @@ def send_email(subject, body, image_paths=None, is_html=False):
             server.login(email_config['sender_email'], email_config['sender_password'])
             server.send_message(msg)
 
-        print(f"✓ 邮件发送成功: {subject}")
+        # 显示发送成功信息
+        recipient_count = len(recipients)
+        recipients_display = ', '.join(recipients)
+        type_label = {'admin': '管理员', 'user': '用户', 'all': '所有人'}.get(recipient_type, recipient_type)
+        print(f"✓ 邮件发送成功 [{type_label}] ({recipient_count}个收件人): {subject}")
+        print(f"  收件人: {recipients_display}")
         return True
     except Exception as e:
         print(f"✗ 邮件发送失败: {str(e)}")
@@ -944,7 +987,8 @@ AI分析: {'已启用（结合最近新闻）' if CONFIG['ai']['enable'] else '�
 
 ---
 此邮件由贵金属价格监控系统自动发送
-监控邮箱: """ + CONFIG['email']['receiver_email'] + """
+管理员邮箱: """ + ', '.join(CONFIG['email']['admin_emails']) + """
+用户邮箱: """ + ', '.join(CONFIG['email']['user_emails']) + """
 """
 
     return subject, body
@@ -1280,38 +1324,43 @@ def monitor_once():
             else:
                 print("\n  ℹ️  AI分析未启用")
 
-        # 发送启动邮件（首次运行）
+        # 发送启动邮件（首次运行） - 仅发给管理员
         if need_startup_email:
             print("\n📧 发送系统启动邮件...")
             subject, body = format_startup_email(all_metals_data, chart_files, ai_analysis)
-            send_email(subject, body, chart_files)
+            send_email(subject, body, chart_files, recipient_type='admin')
             IS_FIRST_RUN = False  # 标记为已发送
 
-        # 发送暴跌邮件
+        # 发送暴跌邮件 - 发给管理员+用户
         if need_crash_email:
             print("\n📧 发送暴跌警告邮件...")
             subject, body = format_crash_email(crash_list, all_metals_data, chart_files, ai_analysis)
-            send_email(subject, body, chart_files)
+            send_email(subject, body, chart_files, recipient_type='all')
 
-        # 发送每日报告
+        # 发送每日报告 - 发给管理员+用户
         if need_daily_report:
             print("\n📧 发送每日报告...")
             subject, body = format_daily_email(all_metals_data, chart_files, ai_analysis)
-            send_email(subject, body, chart_files)
+            send_email(subject, body, chart_files, recipient_type='all')
 
-        # 发送价格阈值提醒
+        # 发送价格阈值提醒 - 发给管理员+用户
         if alerts_to_send:
             print(f"\n📧 发送价格阈值提醒（{len(alerts_to_send)}个阈值）...")
             subject, body = format_price_alert_email(alerts_to_send, all_metals_data, chart_files, ai_analysis)
-            send_email(subject, body, chart_files)
+            send_email(subject, body, chart_files, recipient_type='all')
 
         # 显示当前价格信息
         print("\n=== 当前价格概览 ===")
+        has_data = False
         for metal_type, metal_data in all_metals_data.items():
             if metal_data and metal_data.get('parsed_data') and metal_data['parsed_data']['realtime']:
                 latest = metal_data['parsed_data']['realtime'][-1]
                 metal_name = METAL_TYPES[metal_type]['name']
                 print(f"{metal_name}: ¥{latest['price']:.2f} 元/克 ({latest['rate']:+.2f}%)")
+                has_data = True
+
+        if not has_data:
+            print("  （暂无价格数据）")
 
         # 清理过期图表
         clean_old_charts()
@@ -1322,11 +1371,11 @@ def monitor_once():
         error_msg = str(e)
         print(f"\n✗ 监控失败: {error_msg}")
 
-        # 检查是否应该发送错误邮件（避免重复）
+        # 检查是否应该发送错误邮件（避免重复） - 仅发给管理员
         if should_send_error_email(error_msg):
             print("📧 发送错误警告邮件...")
             subject, body = format_error_email(error_msg)
-            send_email(subject, body)
+            send_email(subject, body, recipient_type='admin')
         else:
             print("  （错误邮件已在近期发送，跳过本次发送）")
 
@@ -1366,7 +1415,27 @@ def main():
 
     print(f"重试次数: {CONFIG['monitor']['max_retries']}次")
     print(f"重试延迟: {CONFIG['monitor']['retry_delay']}秒")
-    print(f"通知邮箱: {CONFIG['email']['receiver_email']}")
+
+    # 显示管理员邮箱
+    admin_count = len(CONFIG['email']['admin_emails'])
+    if admin_count > 0:
+        if admin_count == 1:
+            print(f"管理员邮箱 (系统管理): {CONFIG['email']['admin_emails'][0]}")
+        else:
+            print(f"管理员邮箱 ({admin_count}个, 系统管理):")
+            for email in CONFIG['email']['admin_emails']:
+                print(f"  - {email}")
+
+    # 显示用户邮箱
+    user_count = len(CONFIG['email']['user_emails'])
+    if user_count > 0:
+        if user_count == 1:
+            print(f"用户邮箱 (价格监控): {CONFIG['email']['user_emails'][0]}")
+        else:
+            print(f"用户邮箱 ({user_count}个, 价格监控):")
+            for email in CONFIG['email']['user_emails']:
+                print(f"  - {email}")
+
     print(f"每日报告: {', '.join(CONFIG['monitor']['daily_report_times'])}")
     ai_status = "已启用（结合最近新闻）" if CONFIG['ai']['enable'] else "未启用"
     print(f"AI分析: {ai_status} ({CONFIG['ai']['model']})" if CONFIG['ai']['enable'] else f"AI分析: {ai_status}")

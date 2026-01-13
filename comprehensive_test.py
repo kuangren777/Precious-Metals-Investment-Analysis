@@ -122,9 +122,9 @@ class ComprehensiveTest:
 
             # 验证必需配置项
             required_keys = {
-                'email': ['sender_email', 'receiver_email', 'smtp_server', 'smtp_port'],
-                'monitor': ['check_interval', 'crash_threshold', 'daily_report_times'],
-                'api': ['api_url'],
+                'email': ['sender_email', 'admin_emails', 'user_emails', 'smtp_server', 'smtp_port'],
+                'monitor': ['check_interval', 'gold_crash_threshold', 'daily_report_times'],
+                'api': ['gold_api_url', 'silver_api_url'],
                 'ai': ['enable', 'api_base_url', 'api_key', 'model'],
                 'storage': ['charts_dir', 'keep_history', 'history_days']
             }
