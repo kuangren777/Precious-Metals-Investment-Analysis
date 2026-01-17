@@ -284,25 +284,60 @@ def create_single_metal_chart(metal_type, metal_data, timestamp, charts_dir):
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle(f'工商银行{metal_name}价格分析', fontsize=16, fontweight='bold')
 
-    # 1. 实时价格走势
+    # 1. 过去24小时价格走势
     if parsed_data['realtime']:
         ax = axes[0, 0]
-        times = [datetime.fromisoformat(item['time'].replace('Z', '+00:00')) for item in parsed_data['realtime']]
-        prices = [item['price'] for item in parsed_data['realtime']]
+
+        # 获取当前时间和24小时前的时间
+        now = datetime.now()
+        twenty_four_hours_ago = now - timedelta(hours=24)
+
+        # 筛选出过去24小时的数据点
+        last_24h_data = []
+        for item in parsed_data['realtime']:
+            item_time = datetime.fromisoformat(item['time'].replace('Z', '+00:00'))
+            # 移除时区信息以便比较
+            item_time_naive = item_time.replace(tzinfo=None)
+            if item_time_naive >= twenty_four_hours_ago:
+                last_24h_data.append(item)
+
+        # 如果有过去24小时的数据就使用，否则使用所有realtime数据
+        data_to_plot = last_24h_data if last_24h_data else parsed_data['realtime']
+
+        times = [datetime.fromisoformat(item['time'].replace('Z', '+00:00')) for item in data_to_plot]
+        prices = [item['price'] for item in data_to_plot]
 
         ax.plot(times, prices, color=color, linewidth=2)
-        ax.set_title('实时价格走势', fontsize=12, fontweight='bold')
+        ax.set_title('过去24小时价格走势', fontsize=12, fontweight='bold')
         ax.set_xlabel('时间')
         ax.set_ylabel('价格 (元/克)')
         ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        
+        # 根据数据时间跨度选择合适的时间格式
+        if len(times) >= 2:
+            time_span = (times[-1] - times[0]).total_seconds() / 3600  # 小时数
+            if time_span > 12:
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+            else:
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        else:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
 
-        # 添加当前价格标注
+        # 添加当前价格标注和数据点数量标注
         if prices:
             current_price = prices[-1]
             ax.axhline(y=current_price, color='red', linestyle='--', alpha=0.5)
-            ax.text(0.02, 0.98, f'当前价: ¥{current_price:.2f}',
+            
+            # 计算24小时内的涨跌幅
+            if len(prices) > 1:
+                first_price = prices[0]
+                change_rate = ((current_price - first_price) / first_price) * 100
+                change_text = f'{change_rate:+.2f}%'
+            else:
+                change_text = 'N/A'
+            
+            ax.text(0.02, 0.98, f'当前价: ¥{current_price:.2f}\n24h涨跌: {change_text}\n数据点: {len(data_to_plot)}',
                    transform=ax.transAxes, fontsize=10, verticalalignment='top',
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
@@ -581,7 +616,7 @@ def save_ai_analysis(analysis_text, chart_files, all_metals_data):
 
 
 def detect_crash(all_metals_data):
-    """检测任意金属价格暴跌"""
+    """检测任意金属价格暴跌（基于1小时前的价格判断）"""
     crash_list = []
 
     for metal_type, metal_data in all_metals_data.items():
@@ -600,30 +635,57 @@ def detect_crash(all_metals_data):
             'is_crash': False,
             'rate': 0,
             'current_price': 0,
-            'previous_price': 0
+            'previous_price': 0,
+            'compare_time': ''  # 对比的时间点
         }
 
-        # 从实时数据检测
+        # 从实时数据检测：与1小时前的价格比较
         if parsed_data['realtime'] and len(parsed_data['realtime']) > 0:
             latest = parsed_data['realtime'][-1]
-            crash_info['rate'] = latest['rate']
             crash_info['current_price'] = latest['price']
+            current_time = datetime.fromisoformat(latest['time'].replace('Z', '+00:00'))
 
-            if latest['rate'] <= crash_threshold:
-                crash_info['is_crash'] = True
+            # 查找1小时前的价格数据
+            one_hour_ago = current_time - timedelta(hours=1)
+            hour_ago_price = None
+            hour_ago_time = None
 
-        # 从日数据检测（作为补充）
-        if not crash_info['is_crash'] and parsed_data['day'] and len(parsed_data['day']) >= 2:
-            today = parsed_data['day'][-1]
-            yesterday = parsed_data['day'][-2]
+            # 遍历实时数据，找到最接近1小时前的数据点
+            for item in parsed_data['realtime']:
+                item_time = datetime.fromisoformat(item['time'].replace('Z', '+00:00'))
+                # 找到1小时前或更早的最近一个数据点
+                if item_time <= one_hour_ago:
+                    hour_ago_price = item['price']
+                    hour_ago_time = item_time
+                elif hour_ago_price is None and item_time < current_time:
+                    # 如果没有1小时前的数据，使用最早可用的数据
+                    hour_ago_price = item['price']
+                    hour_ago_time = item_time
 
-            if yesterday['close'] > 0:
-                rate = ((today['close'] - yesterday['close']) / yesterday['close']) * 100
+            # 计算相对于1小时前的涨跌幅
+            if hour_ago_price and hour_ago_price > 0:
+                rate = ((latest['price'] - hour_ago_price) / hour_ago_price) * 100
+                crash_info['rate'] = rate
+                crash_info['previous_price'] = hour_ago_price
+                crash_info['compare_time'] = hour_ago_time.strftime('%H:%M') if hour_ago_time else ''
+
                 if rate <= crash_threshold:
                     crash_info['is_crash'] = True
-                    crash_info['rate'] = rate
-                    crash_info['current_price'] = today['close']
-                    crash_info['previous_price'] = yesterday['close']
+
+        # 如果实时数据不足，从日数据检测（作为补充）
+        if not crash_info['is_crash'] and crash_info['previous_price'] == 0:
+            if parsed_data['day'] and len(parsed_data['day']) >= 2:
+                today = parsed_data['day'][-1]
+                yesterday = parsed_data['day'][-2]
+
+                if yesterday['close'] > 0:
+                    rate = ((today['close'] - yesterday['close']) / yesterday['close']) * 100
+                    if rate <= crash_threshold:
+                        crash_info['is_crash'] = True
+                        crash_info['rate'] = rate
+                        crash_info['current_price'] = today['close']
+                        crash_info['previous_price'] = yesterday['close']
+                        crash_info['compare_time'] = '昨日收盘'
 
         if crash_info['is_crash']:
             crash_list.append(crash_info)
@@ -869,8 +931,10 @@ def format_crash_email(crash_list, all_metals_data, chart_files, ai_analysis):
     # 列出所有暴跌的金属详情
     body += "=== 暴跌详情 ===\n\n"
     for crash in crash_list:
+        compare_info = f"（对比时间: {crash.get('compare_time', '1小时前')}）" if crash.get('compare_time') else "（对比1小时前）"
         body += f"""【{crash['metal_name']}】
   当前价格: ¥{crash['current_price']:.2f} 元/克
+  1小时前价格: ¥{crash['previous_price']:.2f} 元/克 {compare_info}
   跌幅: {crash['rate']:.2f}%
   触发阈值: {crash['threshold']:.1f}%
 
