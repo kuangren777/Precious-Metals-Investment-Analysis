@@ -123,6 +123,7 @@ def load_config():
             'platinum_crash_threshold': config.getfloat('Monitor', 'platinum_crash_threshold', fallback=-2.5),
             'palladium_crash_threshold': config.getfloat('Monitor', 'palladium_crash_threshold', fallback=-3.5),
             'price_alert_interval': config.getint('Monitor', 'price_alert_interval', fallback=3600),
+            'crash_alert_interval': config.getint('Monitor', 'crash_alert_interval', fallback=3600),
             'daily_report_times': [t.strip() for t in config.get('Monitor', 'daily_report_times').split(',')],
             'max_retries': config.getint('Monitor', 'max_retries', fallback=3),
             'retry_delay': config.getint('Monitor', 'retry_delay', fallback=5),
@@ -991,6 +992,7 @@ def format_startup_email(all_metals_data, chart_files, ai_analysis):
   · 白银: {CONFIG['monitor']['silver_crash_threshold']:.1f}%
   · 铂金: {CONFIG['monitor']['platinum_crash_threshold']:.1f}%
   · 钯金: {CONFIG['monitor']['palladium_crash_threshold']:.1f}%
+暴跌邮件间隔: {CONFIG['monitor']['crash_alert_interval']/3600:.1f}小时
 定时报告: {', '.join(CONFIG['monitor']['daily_report_times'])}
 AI分析: {'已启用（结合最近新闻）' if CONFIG['ai']['enable'] else '未启用'}
 
@@ -1181,32 +1183,36 @@ def should_send_error_email(error_msg):
 
 
 def should_send_crash_email(crash_list):
-    """检查是否应该发送暴跌邮件（1小时内不重复发送）"""
+    """检查是否应该发送暴跌邮件（使用配置的时间间隔，任意金属暴跌都共享去重）"""
     global LAST_CRASH_EMAIL
 
     if not crash_list:
         return False
 
     current_time = datetime.now()
-    # 使用暴跌金属的名称列表作为键
-    crash_metals = sorted([crash['metal_type'] for crash in crash_list])
-    crash_key = ','.join(crash_metals)
-
-    # 如果这些金属的暴跌在最近1小时内已经发送过，就不再发送
+    crash_interval = CONFIG['monitor']['crash_alert_interval']
+    
+    # 使用固定的键 'any_crash' 来实现：任意金属暴跌后，在配置的时间内都不再发送
+    crash_key = 'any_crash'
+    
+    # 检查是否在配置的时间间隔内已经发送过暴跌邮件
     if crash_key in LAST_CRASH_EMAIL:
         last_time = LAST_CRASH_EMAIL[crash_key]
         time_diff = (current_time - last_time).total_seconds()
-        if time_diff < 3600:  # 1小时 = 3600秒
-            print(f"  ℹ️  相同金属暴跌在{time_diff/60:.1f}分钟前已发送邮件，跳过本次发送")
+        if time_diff < crash_interval:
+            time_diff_hours = time_diff / 3600
+            interval_hours = crash_interval / 3600
+            crash_names = [crash['metal_name'] for crash in crash_list]
+            print(f"  ℹ️  检测到{'/'.join(crash_names)}暴跌，但暴跌邮件在{time_diff_hours:.1f}小时前已发送（间隔{interval_hours:.1f}小时），跳过本次发送")
             return False
 
     # 记录本次发送
     LAST_CRASH_EMAIL[crash_key] = current_time
-
-    # 清理超过2小时的旧记录
+    
+    # 清理超过2倍间隔时间的旧记录
     keys_to_remove = []
     for key, time_val in LAST_CRASH_EMAIL.items():
-        if (current_time - time_val).total_seconds() > 7200:
+        if (current_time - time_val).total_seconds() > (crash_interval * 2):
             keys_to_remove.append(key)
     for key in keys_to_remove:
         del LAST_CRASH_EMAIL[key]
@@ -1476,6 +1482,9 @@ def main():
     if has_thresholds:
         interval_minutes = CONFIG['monitor']['price_alert_interval'] / 60
         print(f"  提醒间隔: {interval_minutes:.0f}分钟")
+    
+    crash_interval_hours = CONFIG['monitor']['crash_alert_interval'] / 3600
+    print(f"暴跌邮件间隔: {crash_interval_hours:.1f}小时")
 
     print(f"重试次数: {CONFIG['monitor']['max_retries']}次")
     print(f"重试延迟: {CONFIG['monitor']['retry_delay']}秒")

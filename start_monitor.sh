@@ -34,8 +34,6 @@ fi
 
 echo "✓ 配置文件已加载"
 echo ""
-echo "正在启动监控系统..."
-echo "按 Ctrl+C 停止"
-echo ""
 
-python gold_monitor.py
+# 使用 -u 参数禁用输出缓冲，确保实时显示日志
+python3 -u gold_monitor.py
